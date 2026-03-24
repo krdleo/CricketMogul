@@ -1,0 +1,7 @@
+# Cricket Dynasty Engine
+# Python 3.10+ recommended (dataclasses built-in, match-statement available)
+# No external dependencies for Phase 1 — pure standard library
+
+# Optional for analysis/visualization (Phase 6+):
+# numpy>=1.24
+# matplotlib>=3.7
