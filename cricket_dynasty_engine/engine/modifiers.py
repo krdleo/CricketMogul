@@ -73,42 +73,58 @@ def get_base_probs(phase: str) -> Dict[str, float]:
     return dict(BASE_PROBS[phase])
 
 
+# ── Attribute scaling helper ──────────────────────────────────────────────────
+
+def _attr_scale(attr: int, center: int = 50) -> float:
+    """
+    Map an attribute (1–100) to a multiplicative scale factor centered at 1.0
+    when attr == center (50 by default).
+
+    Uses a power law (exponent 0.85) for smooth but meaningful differentiation:
+      attr=20 → 0.44   attr=37 → 0.77   attr=50 → 1.00
+      attr=75 → 1.41   attr=87 → 1.62   attr=90 → 1.67
+
+    Floor at 0.10 so even the worst player still participates.
+    """
+    return max(0.10, (attr / center) ** 0.85)
+
+
 # ── Batter modifier ───────────────────────────────────────────────────────────
 
 def batter_modifier(batter: "Player", phase: str) -> Dict[str, float]:
     """
-    Adjust probabilities based on batter attributes.
+    Ratio-based batter modifier — all effects scale multiplicatively
+    around a neutral point of 1.0 at attribute = 50.
 
-    batting_power  → raises 4s/6s, slightly raises wickets (risk)
-    batting_technique → raises dots→1s (rotation), lowers wicket probability
-    form           → global multiplier on positive outcomes
+    batting_power    → drives boundary frequency (4s/6s).
+                       High power = more boundaries AND slightly more risk.
+    batting_technique → drives strike rotation (1s/2s) and wicket avoidance.
+                       High technique = fewer dots, more singles, fewer dismissals.
+
+    The combination power=high + technique=low models a slogger:
+    many 4s and 6s, but also frequent wickets.
     """
-    p = batter.batting_power / 100.0
-    t = batter.batting_technique / 100.0
-    f = batter.form
+    ps = _attr_scale(batter.batting_power)      # power scale
+    ts = _attr_scale(batter.batting_technique)  # technique scale
+    f  = batter.form
 
-    # Power: each +10 above 50 shifts ~0.008 prob from dot → 4/6
-    power_delta = (p - 0.5) * 0.06
-
-    # Technique: each +10 above 50 shifts ~0.006 prob from dot → 1/2
-    tech_delta = (t - 0.5) * 0.05
-
-    # Risk factor: high power slightly increases wicket chance
-    risk = (p - 0.5) * 0.015
-
-    mod = {
-        "dot":    1.0 - (power_delta * 0.5) - (tech_delta * 0.6),
-        "1":      1.0 + tech_delta * 0.8,
-        "2":      1.0 + tech_delta * 0.5,
+    mod: Dict[str, float] = {
+        # Dot ball inverse of combined batting quality
+        "dot":    1.0 / (0.40 * ps + 0.60 * ts),
+        # Strike rotation driven by technique
+        "1":      ts ** 0.55,
+        "2":      ts ** 0.60,
         "3":      1.0,
-        "4":      1.0 + power_delta * 0.9,
-        "6":      1.0 + power_delta * 1.2,
-        "wicket": 1.0 + risk - (t - 0.5) * 0.08,
+        # Boundary hitting driven by power
+        "4":      ps ** 0.65,
+        "6":      ps ** 0.80,
+        # Risk: high power slightly raises dismissal chance;
+        #       high technique suppresses it significantly.
+        "wicket": (ps ** 0.18) / (ts ** 0.55),
         "wide":   1.0,
         "no_ball": 1.0,
     }
 
-    # Apply form as a global multiplier on run-scoring outcomes
     for key in ("1", "2", "3", "4", "6"):
         mod[key] *= f
     mod["wicket"] *= (2.0 - f)   # poor form → more dismissals
@@ -125,48 +141,50 @@ def bowler_modifier(
     weather: "WeatherConditions",
 ) -> Dict[str, float]:
     """
-    Adjust probabilities based on bowler attributes and conditions.
+    Ratio-based bowler modifier.
 
-    economy    → more dots, fewer boundaries
-    swing_seam → wicket probability for pacers (pitch/weather amplified)
-    spin       → wicket probability for spinners (pitch amplified)
-    pace       → small wicket/dot bonus in powerplay & death
+    economy    → tight lines = more dots, fewer boundaries, fewer extras.
+                 High economy suppresses scoring across all shot types.
+    swing_seam → primary wicket-taking tool for pacers.
+                 Amplified by pitch pace_modifier and weather swing bonus.
+    spin       → primary wicket-taking tool for spinners.
+                 Amplified by pitch spin_modifier (grows with deterioration).
+    pace       → additional wicket/dot contribution in powerplay & death.
     """
-    eco = bowler.economy / 100.0
-    swing = bowler.swing_seam / 100.0
-    spn = bowler.spin / 100.0
-    pc = bowler.pace / 100.0
+    eco_s = _attr_scale(bowler.economy)   # economy scale
 
-    # Economy effect: restricts scoring
-    eco_delta = (eco - 0.5) * 0.06
-
-    # Wicket-taking
-    if bowler.is_pacer():
-        effectiveness = swing * pitch.pace_modifier * (1.0 + weather.swing_bonus)
-        # Pace bonus in powerplay and death
-        if phase in ("powerplay", "death"):
-            effectiveness *= (1.0 + (pc - 0.5) * 0.2)
-    elif bowler.is_spinner():
-        effectiveness = spn * pitch.spin_modifier_at_over(0)   # caller can override
-        # Spinners more effective in middle overs
-        if phase == "middle":
-            effectiveness *= 1.12
-    else:
-        effectiveness = 0.3   # part-timers
-
-    wicket_delta = (effectiveness - 0.4) * 0.08
-
-    mod = {
-        "dot":    1.0 + eco_delta * 0.7,
-        "1":      1.0 - eco_delta * 0.3,
-        "2":      1.0 - eco_delta * 0.4,
+    # Good economy bowler (eco_s > 1) compresses scoring probabilities.
+    # Poor economy bowler (eco_s < 1) leaks runs; extras go up.
+    mod: Dict[str, float] = {
+        "dot":    eco_s ** 0.65,
+        "1":      1.0 / (eco_s ** 0.30),
+        "2":      1.0 / (eco_s ** 0.40),
         "3":      1.0,
-        "4":      1.0 - eco_delta * 0.8,
-        "6":      1.0 - eco_delta * 0.9,
-        "wicket": 1.0 + wicket_delta,
-        "wide":   1.0,
-        "no_ball": 1.0,
+        "4":      1.0 / (eco_s ** 0.75),
+        "6":      1.0 / (eco_s ** 0.80),
+        "wicket": 1.0,              # filled in below
+        "wide":   1.0 / (eco_s ** 0.50),   # poor economy → more wides
+        "no_ball": 1.0 / (eco_s ** 0.30),
     }
+
+    # ── Wicket-taking effectiveness ────────────────────────────────────────
+    if bowler.is_pacer():
+        effectiveness = (bowler.swing_seam / 100.0) * pitch.pace_modifier
+        effectiveness *= (1.0 + weather.swing_bonus)
+        if phase in ("powerplay", "death"):
+            pace_bonus = max(0.0, (bowler.pace / 100.0 - 0.5)) * 0.35
+            effectiveness *= (1.0 + pace_bonus)
+    elif bowler.is_spinner():
+        effectiveness = (bowler.spin / 100.0) * pitch.spin_modifier_at_over(0)
+        if phase == "middle":
+            effectiveness *= 1.15
+    else:
+        effectiveness = 0.28   # part-timers, rare wickets
+
+    # Neutral point: effectiveness = 0.50 (50-stat bowler, balanced pitch)
+    # → eff_scale = 1.0 → wicket_mod = 1.0 (no change from base probs)
+    eff_scale = max(0.25, effectiveness / 0.50)
+    mod["wicket"] = eff_scale ** 0.45
 
     return mod
 
@@ -174,16 +192,22 @@ def bowler_modifier(
 # ── Pitch modifier ─────────────────────────────────────────────────────────────
 
 def pitch_modifier(pitch: "PitchConditions", over: int) -> Dict[str, float]:
-    """Global pitch modifier applied on top of bowler-specific effects."""
-    bm = pitch.batting_modifier
+    """
+    Pitch condition modifier, centered at neutral for batting_modifier = 1.0.
+    A balanced pitch (bm=1.0) applies no modifier to any outcome.
+    Batting paradise (bm=1.15) boosts boundaries, reduces dots/wickets.
+    Seaming pitch (bm=0.90) suppresses scoring, aids wicket-taking.
+    """
+    delta = pitch.batting_modifier - 1.0   # range ~-0.20 to +0.20
+
     return {
-        "dot":    2.0 - bm,       # batting-friendly → fewer dots
-        "1":      bm * 0.95,
-        "2":      bm * 1.0,
+        "dot":    1.0 - delta * 0.85,
+        "1":      1.0 + delta * 0.50,
+        "2":      1.0 + delta * 0.55,
         "3":      1.0,
-        "4":      bm * 1.05,
-        "6":      bm * 1.08,
-        "wicket": 2.0 - bm,       # batting-friendly → fewer wickets
+        "4":      1.0 + delta * 1.10,
+        "6":      1.0 + delta * 1.20,
+        "wicket": 1.0 - delta * 0.80,
         "wide":   1.0,
         "no_ball": 1.0,
     }
